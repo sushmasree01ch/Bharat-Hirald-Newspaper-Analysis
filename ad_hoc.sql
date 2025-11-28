@@ -1,153 +1,184 @@
+-- Business Request – 1: Monthly Circulation Drop Check 
+-- Generate a report showing the top 3 months (2019–2024) where any city recorded the 
+-- sharpest month-over-month decline in net_circulation. 
 
-/*
-Business Request – 1: Monthly Circulation Drop Check
-Generate a report showing the top 3 months (2019–2024) where any city recorded the sharpest month-over-month decline in net_circulation.
-Fields:city_name, month (YYYY-MM). net_circulation */
+with cte1 as (select c.city_id,
+				c.city as city_name,
+				p.Month as Month,
+				p.Net_Circulation as net_circulation,
+				lag(Net_Circulation) over (partition by c.city_id order by p.Month) as prev_net_circulation
+from fact_print_sales p 
+join dim_city c 
+on c.city_id = p.City_ID)
+select city_name,Month,net_circulation,
+		prev_net_circulation,
+		(net_circulation - prev_net_circulation) as MOM_change
+from cte1
+where prev_net_circulation is not null 
+order by  MOM_change ,Month
+limit 3
+;
 
-with cte_prev_mths as(
-select City_ID, FORMAT(Month, 'yyyyMM') as Month , Net_Circulation, 
-LAG(FORMAT(Month, 'yyyyMM')) OVER(PARTITION BY City_ID order by FORMAT(Month, 'yyyyMM')) as prev_month,
-LAG(Net_Circulation,1,0) OVER(PARTITION BY City_ID order by FORMAT(Month, 'yyyyMM'))
-as prev_Circulation
-from fact_print_sales)
-,cte_MOM_Circulations as(
-select * ,
-(Net_Circulation-prev_Circulation) as chg_prev_mth 
-from cte_prev_mths
-where (Net_Circulation-prev_Circulation) <0)
-select * from(
-select c.city,m.Month,m.Net_Circulation,m.prev_month, m.prev_circulation,m.chg_prev_mth,
-DENSE_RANK() OVER(order by chg_prev_mth) as rnk from cte_MOM_Circulations m
-INNER JOIN dim_city c ON c.city_id = m.City_ID) b where b.rnk <=3
 
-/*
-Business Request – 2: Yearly Revenue Concentration by Category
-Identify ad categories that contributed > 50% of total yearly ad revenue.
-Fields: year,category_name,category_revenue,total_revenue_year,pct_of_year_total */
+-- Business Request – 2: Yearly Revenue Concentration by Category 
+-- Identify ad categories that contributed > 50% of total yearly ad revenue. 
 
-with cte_ad_revenue_INR as(
-select * , case when currency = 'USD' then 88.17 * ad_revenue 
-				when currency = 'EUR' then 103.29*ad_revenue
-                else ad_revenue end as ad_revenue_INR from fact_ad_revenue
+with cte1 as (select r.year,c.ad_category_id,c.standard_ad_category ,
+sum(r.ad_revenue_inr) as category_ad_revenue
+from fact_ad_revenue r 
+join dim_ad_category1 c 
+on r.ad_category = c.ad_category_id
+group by r.year , c.standard_ad_category,c.ad_category_id ),
+cte2 as (select year,sum(category_ad_revenue) as total_revenue_year 
+from cte1
+group by year)
+select e1.year,e1.ad_category_id,e1.standard_ad_category,e1.category_ad_revenue,e2.total_revenue_year,
+round((e1.category_ad_revenue/e2.total_revenue_year)*100,2) as pct_of_total_year
+from cte1 e1
+join cte2 e2
+on e1.year = e2.year
+where (e1.category_ad_revenue*100/e2.total_revenue_year)
+order by e1.year,pct_of_total_year desc;
+
+
+-- Business Request – 3: 2024 Print Efficiency Leaderboard 
+-- For 2024, rank cities by print efficiency = net_circulation / copies_printed. Return top 5
+-- Explanation:-copies_printed = sum(copies_sold)
+-- 				net_circulataion=sum(copies_sold-copies_returned).
+
+
+with cte as (select c.city , 
+sum(case when p.year = 2024 then p.Copies_Sold end ) as Copies_sold_2024,
+sum(case when p.year = 2024 then p.net_circulation end ) as Net_circulation_2024
+
+from dim_city c 
+join fact_print_sales p 
+on c.city_id = p.City_ID 
+group by c.city)
+select city,Copies_sold_2024,Net_circulation_2024,
+       ROUND(Net_circulation_2024/NULLIF(Copies_sold_2024,0)*100,2) AS efficiency_ratio,
+       DENSE_RANK() OVER (ORDER BY Net_circulation_2024/NULLIF(Copies_sold_2024,0) DESC) AS efficiency_rank_2024
+FROM cte
+WHERE Copies_sold_2024 > 0
+ORDER BY efficiency_rank_2024
+LIMIT 5;
+
+
+
+
+-- Business Request – 4 : Internet Readiness Growth (2021) 
+-- For each city, compute the change in internet penetration from Q1-2021 to Q4-2021 
+-- and identify the city with the highest improvement. 
+
+SELECT
+    t1.city,
+    MAX(CASE WHEN t2.quarter = 'Q1' AND t2.Year = '2021' THEN t2.internet_penetration ELSE NULL END) AS internet_rate_q1_2021,
+    MAX(CASE WHEN t2.quarter = 'Q4' AND t2.Year = '2021' THEN t2.internet_penetration ELSE NULL END) AS internet_rate_q4_2021,
+    round((MAX(CASE WHEN t2.quarter = 'Q4' AND t2.Year = '2021' THEN t2.internet_penetration ELSE NULL END) - 
+     MAX(CASE WHEN t2.quarter = 'Q1' AND t2.Year = '2021' THEN t2.internet_penetration ELSE NULL END)),2) AS delta_internet_rate
+FROM
+    dim_city AS t1
+JOIN
+    fact_city_readiness AS t2 ON t1.city_id = t2.city_id
+GROUP BY
+    t1.city
+ORDER BY
+    delta_internet_rate DESC;
+
+
+
+-- Business Request – 5: Consistent Multi-Year Decline (2019→2024) 
+-- Find cities where both net_circulation and ad_revenue decreased every year from 2019 
+-- through 2024 (strictly decreasing sequences). 
+
+WITH yearly_data AS (
+    SELECT 
+        c.city as city_name,
+        fps.year,
+        SUM(fps.Net_Circulation) AS yearly_net_circulation,
+        round(SUM(far.ad_revenue_inr),2) AS yearly_ad_revenue
+    FROM fact_print_sales fps
+    JOIN dim_city c ON fps.city_id = c.city_id
+    JOIN fact_ad_revenue far ON fps.edition_id = far.edition_id AND fps.year = far.year
+    WHERE fps.year BETWEEN "2019" AND "2024"
+    GROUP BY c.city, fps.year
+),
+
+check_decline AS (
+    SELECT 
+        city_name,
+        year,
+        yearly_net_circulation,
+        yearly_ad_revenue,
+        LAG(yearly_net_circulation) OVER (PARTITION BY city_name ORDER BY year) AS prev_net_circulation,
+        LAG(yearly_ad_revenue) OVER (PARTITION BY city_name ORDER BY year) AS prev_ad_revenue
+    FROM yearly_data
 )
 
-, cte_category_revenue as(
-select SUBSTRING(Quarter,1,4) as Year, ad_category as category_name, ROUND(sum(ad_revenue_INR),2) as category_revenue 
-from cte_ad_revenue_INR
-group by SUBSTRING(Quarter,1,4), ad_category)
+SELECT 
+    city_name,
+    year,
+    yearly_net_circulation,
+    yearly_ad_revenue,
+    CASE 
+        WHEN SUM(CASE WHEN yearly_net_circulation < prev_net_circulation THEN 1 ELSE 0 END) 
+             = COUNT(prev_net_circulation) 
+        THEN 'Yes' ELSE 'No' 
+    END AS is_declining_print,
+    CASE 
+        WHEN SUM(CASE WHEN yearly_ad_revenue < prev_ad_revenue THEN 1 ELSE 0 END) 
+             = COUNT(prev_ad_revenue) 
+        THEN 'Yes' ELSE 'No' 
+    END AS is_declining_ad_revenue,
+    CASE 
+        WHEN SUM(CASE WHEN yearly_net_circulation < prev_net_circulation THEN 1 ELSE 0 END) 
+             = COUNT(prev_net_circulation)
+         AND SUM(CASE WHEN yearly_ad_revenue < prev_ad_revenue THEN 1 ELSE 0 END) 
+             = COUNT(prev_ad_revenue)
+        THEN 'Yes' ELSE 'No' 
+    END AS is_declining_both
+FROM check_decline
+GROUP BY city_name, year,
+    yearly_net_circulation,
+    yearly_ad_revenue;
 
-,cte_yearly_revenue as(
-select *, SUM(category_revenue) OVER(PARTITION BY Year) as total_revenue_year from cte_category_revenue)
-
-select year,a.standard_ad_category,c.category_name,c.total_revenue_year, ROUND((category_revenue/total_revenue_year)*100.0,2) as pct_of_year_total 
-from cte_yearly_revenue c 
-INNER JOIN dim_ad_category a on c.category_name = a.ad_category_id;
-
-
-/*
-Business Request – 3: 2024 Print Efficiency Leaderboard
-For 2024, rank cities by print efficiency = net_circulation / copies_printed. Return top 5.
-Fields: city_name ,copies_printed_2024,net_circulation_2024 ,efficiency_ratio = net_circulation_2024 / copies_printed_2024 ,efficiency_rank_2024*/
-
-with cte_printed_copies_2024 as(
-select City_ID,
-SUM(case when year(Month) = 2024 then (Copies_Sold+copies_returned)end) as copies_printed_2024,
-SUM(case when year(Month) = 2024 then Net_Circulation end) as net_circulation_2024
-from fact_print_sales
-group by City_ID)
-,cte_efficiency_ratio as(
-select *,CAST(100.0*(net_circulation_2024*1.0/copies_printed_2024*1.0) as DECIMAL(5,2)) as efficiency_ratio from cte_printed_copies_2024)
-
-select * from (
-select c.city,e.copies_printed_2024,e.net_circulation_2024,e.efficiency_ratio, DENSE_RANK() OVER(order by efficiency_ratio desc) as efficiency_rank_2024 
-from cte_efficiency_ratio e
-INNER JOIN dim_city c ON c.city_id = e.City_ID
-) b where b.efficiency_rank_2024<=5
-
-/*
-Business Request – 4 : Internet Readiness Growth (2021)
-For each city, compute the change in internet penetration from Q1-2021 to Q4-2021 and identify the city with the highest improvement.
-Fields: city_name, internet_rate_q1_2021,internet_rate_q4_2021, delta_internet_rate = internet_rate_q4_2021 − internet_rate_q1_2021 */
-
-with cte_internet_rate as(
-select city_id, CAST(SUM(case when quarter = '2021-Q1' then internet_penetration end) as DECIMAL(5,2)) as internet_rate_q1_2021,
-CAST(SUM( case when quarter = '2021-Q4' then internet_penetration end) as DECIMAL(5,2)) as internet_rate_q4_2021
-from fact_city_readiness
-group by city_id)
-
-select c.city,i.internet_rate_q1_2021,i.internet_rate_q4_2021 , (internet_rate_q4_2021-internet_rate_q1_2021) as delta_internet_rate from cte_internet_rate i 
-INNER JOIN dim_city c on i.city_id = c.city_id
-order by (internet_rate_q4_2021-internet_rate_q1_2021) desc
+-- Business Request – 6 : 2021 Readiness vs Pilot Engagement Outlier 
+-- In 2021, identify the city with the highest digital readiness score but among the bottom 3 
+-- in digital pilot engagement. 
+-- readiness_score = AVG(smartphone_rate, internet_rate, literacy_rate) 
+-- “Bottom 3 engagement” uses the chosen engagement metric provided (e.g., 
+-- engagement_rate, active_users, or sessions). 
 
 
 
-
-/*
-Business Request – 5: Consistent Multi-Year Decline (2019→2024)
-Find cities where both net_circulation and ad_revenue decreased every year from 2019 through 2024 (strictly decreasing sequences).
-Fields: city_name,year,yearly_net_circulation,yearly_ad_revenue,is_declining_print (Yes/No per city over 2019–2024)
-,is_declining_ad_revenue (Yes/No)
-,is_declining_both (Yes/No) */
-
-
-with cte_yearly_metrics as(
-select s.City_ID as city_id, YEAR(s.Month) as Year, SUM(Net_Circulation) as yearly_net_circulation,
-ROUND(SUM(ar.ad_revenue),2) as yearly_ad_revenue from fact_print_sales s INNER JOIN 
-fact_ad_revenue ar ON s.edition_ID = ar.edition_id and YEAR(s.Month) = SUBSTRING(ar.Quarter,1,4)
-group by s.City_ID, YEAR(s.Month))
-
-,cte_prev_yr_metrics as(
-select *, LAG(yearly_net_circulation) OVER(PARTITION BY city_id order by year) as prev_yr_circulation ,
-LAG(yearly_ad_revenue) OVER(PARTITION BY city_id order by year) as prev_yr_ad_revenue
-from cte_yearly_metrics)
-
-,cte_is_decline as(
-select city_id, year ,
-CASE when yearly_net_circulation < prev_yr_circulation then 'Yes' else 'No' end as is_declining_print,
-CASE when yearly_ad_revenue < prev_yr_ad_revenue then 'Yes' else 'No' end as is_declining_ad_revenue
-from cte_prev_yr_metrics)
-
-,cte_final_result as(
-select * , case when is_declining_print = 'Yes' and is_declining_ad_revenue= 'Yes' then 'Yes' else 'No' end as is_declining_both
-from cte_is_decline)
-
---select * from cte_final_result
-
-select c.city, STRING_AGG( case when is_declining_both='Yes' then year else NULL end,',') as declining_years,
-sum( case when is_declining_both = 'Yes' then 1 else 0 end ) as   no_years_declined from cte_final_result f 
-INNER JOIN dim_city c on f.city_id = c.city_id
-group by city;
-
-
-/*
-Business Request – 6 : 2021 Readiness vs Pilot Engagement Outlier
-In 2021, identify the city with the highest digital readiness score but among the bottom 3 in digital pilot engagement.
-readiness_score = AVG(smartphone_rate, internet_rate, literacy_rate)
-“Bottom 3 engagement” uses the chosen engagement metric provided (e.g., engagement_rate, active_users, or sessions).
-Fields:
-city_name,readiness_score_2021,engagement_metric_2021,readiness_rank_desc,engagement_rank_asc,is_outlier (Yes/No) */
-
-with cte_readiness_score as(
-select city_id, quarter, CAST((literacy_rate+smartphone_penetration+internet_penetration)/3 AS DECIMAL(5,2)) as readiness_score
-from fact_city_readiness)
-,cte_score_2021 as(
-select city_id, AVG(case when SUBSTRING(quarter,1,4) = 2021 then readiness_score else NULL end) as readiness_score_2021 
-from cte_readiness_score
-group by city_id)
-
-,cte_engagement_metric as(
-select city_id, SUBSTRING(launch_month,1,4) as Year, SUM( downloads_or_accesses) as engagement_metric_2021  from fact_digital_pilot
-group by city_id, SUBSTRING(launch_month,1,4))
-
-,cte_ranks as(
-select c.city,s.readiness_score_2021,e.engagement_metric_2021,
-DENSE_RANK() OVER(order by s.readiness_score_2021 desc) as readiness_rnk_desc,
-DENSE_RANK() OVER(order by e.engagement_metric_2021) as engagement_rnk
-from cte_score_2021 s INNER JOIN cte_engagement_metric e on s.city_id = e.city_id
-INNER JOIN dim_city c on e.city_id = c.city_id
+WITH readiness AS (
+    SELECT 
+        c.city,
+        round(AVG(cr.literacy_rate + cr.smartphone_penetration + cr.internet_penetration)/3,2)
+        AS readiness_score
+    FROM fact_city_readiness cr
+    JOIN dim_city c ON cr.city_id = c.city_id
+    WHERE cr.year = 2021
+    GROUP BY c.city
+),
+engagement AS (
+    SELECT 
+        c.city,
+        COALESCE(SUM(dp.downloads_or_accesses),0) AS engagement_metric
+    FROM fact_digital_pilot dp
+    JOIN dim_city c ON c.city_id = dp.city_id
+   
+    GROUP BY c.city
 )
-
---select * from cte_ranks
-
-select * , case when readiness_rnk_desc in (1,2,3) and engagement_rnk in (1,2,3) then 'Yes' else 'No' end as is_outlier
-from cte_ranks
+SELECT 
+    r.city,
+    r.readiness_score,
+    e.engagement_metric,
+    RANK() OVER (ORDER BY r.readiness_score DESC) AS readiness_rank_desc,
+    RANK() OVER (ORDER BY e.engagement_metric ASC) AS engagement_rank_asc,
+    CASE 
+       WHEN RANK() OVER (ORDER BY r.readiness_score DESC) = 1
+        AND RANK() OVER (ORDER BY e.engagement_metric ASC) <= 3 
+       THEN 'Yes' ELSE 'No' END AS is_outlier
+FROM readiness r
+JOIN engagement e ON r.city = e.city;
